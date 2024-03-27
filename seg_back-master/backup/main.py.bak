@@ -1,0 +1,307 @@
+import os
+import re
+import json
+import numpy as np
+import PIL.Image as Image
+from io import BytesIO
+import base64
+import cv2
+
+from naive_annotator import NaiveAnnotator
+from annotator import Annotator
+
+from flask import Flask, request
+from flask_cors import CORS
+app = Flask(__name__)
+CORS(app)
+# cors = CORS(app, resources={r"/test": {"origins": "*"}})
+# cors = CORS(app, resources={r"/api/*": {"origins": "*"}})
+
+print('Define annotator')
+annotator = Annotator()
+
+
+@app.route('/')
+def hello_world():
+    return 'Hello World from root!'
+
+@app.route('/test', methods = ['POST'])
+def test():
+    return 'Hello World!'
+
+@app.route('/get_collection_list', methods=['POST'])
+def get_set_list():
+    collection_list = [
+        file_name.replace('.json', '') for file_name in os.listdir('info')
+        if file_name.endswith('.json')
+    ]
+    collection_list.sort()
+    return json.dumps(collection_list).encode()
+
+@app.route('/get_image_list', methods=['POST'])
+def get_image_list():
+    params = request.get_json(silent=True)
+    collection_name = params['collection_name']
+    with open(f'info/{collection_name}.json', 'r') as reader:
+        image_list = eval(reader.read())
+    image_list.sort(key=lambda x: x['image_name'])
+    return json.dumps(image_list).encode()
+
+
+@app.route('/get_image', methods=['POST'])
+def get_image():
+    params = request.get_json(silent=True)
+    collection_name = params['collection_name']
+    image_name = params['image_name']
+    image_ratio = float(params['image_ratio'])
+    image_path = (
+        'images/' + collection_name + '/'
+        + ('_' + str(image_ratio) + '.').join(image_name.split('.'))
+    )
+    print('ratio is', image_ratio)
+    if not os.path.exists(image_path):
+        ori_image = Image.open('images/' + collection_name + '/' + image_name)
+        w, h = ori_image.size
+        new_w = int(w * image_ratio)
+        new_h = int(h * image_ratio)
+        new_image = ori_image.resize((new_w, new_h))
+        new_image.save(image_path)
+    with open(image_path, 'rb') as reader:
+        image_data = reader.read()
+    return base64.b64encode(image_data)
+
+
+@app.route('/get_anno', methods=['POST'])
+def get_anno():
+    params = request.get_json(silent=True)
+    collection_name = params['collection_name']
+    image_name = params['image_name']
+    json_path = (
+        'json/' + collection_name + '/' + image_name.split('.')[0] + '.json'
+    )
+    if not os.path.exists(json_path):
+        with open(json_path, 'w') as writer:
+            writer.write(str([]))
+    with open(json_path, 'r') as reader:
+        content = reader.read()
+    return content.encode()
+
+
+@app.route('/save_anno', methods=['POST'])
+def save_anno():
+    params = request.get_json(silent=True)
+    collection_name = params['collection_name']
+    image_name = params['image_name']
+    json_path = (
+        'json/' + collection_name + '/' + image_name.split('.')[0] + '.json'
+    )
+    anno = params['anno']
+    with open(json_path, 'w') as writer:
+        writer.write(json.dumps(anno, indent=4))
+    return 'Done'.encode()
+
+
+@app.route('/get_pred', methods=['POST'])
+def get_pred():
+    params = request.get_json(silent=True)
+    collection_name = params['collection_name']
+    image_name = params['image_name']
+    # if params['image'] != '':
+    #     image = np.array(
+    #         Image.open(BytesIO(bytes(params['image']['data'])))
+    #     )
+    # else:
+    #     image = None
+    bbox = params['bbox']
+    compress_degree = params['compress_degree']
+    path_pred = annotator.predict(collection_name + '/' + image_name, bbox, compress_degree)
+    return json.dumps(path_pred).encode()
+
+
+# @app.route('/update_pred', methods=['POST'])
+# def update_pred():
+#     params = request.get_json(silent=True)
+#     image_name = params['image_name']
+#     anno = params['anno']
+#     alpha = params['alpha'] / 100
+#     print(alpha)
+#     compress_degree = params['compress_degree']
+#     prediction = annotator.update(image_name, anno, alpha, compress_degree)
+#     return json.dumps(prediction).encode()
+
+
+# @app.route('/finetune', methods=['POST'])
+# def finetune():
+#     params = request.get_json(silent=True)
+#     image_name = params['image_name']
+#     annotator.finetune(image_name)
+#     return 'Done'.encode()
+
+
+@app.route('/upload_image', methods=['POST'])
+def upload_image():
+    params = request.get_json(silent=True)
+    image = base64.b64decode(params['image'].split(';base64,')[1])
+    collection_name = params['collection_name']
+    image_name = params['image_name']
+    with open('images/' + collection_name + '/' + image_name, 'wb') as writer:
+        writer.write(image)
+    image = np.array(
+        Image.open('images/' + collection_name + '/' + image_name)
+    )
+    if len(image.shape) == 2:
+        Image.fromarray(cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)).save(
+            'images/' + collection_name + '/' + image_name
+        )
+    # Update image_list
+    with open(f'info/{collection_name}.json', 'r') as reader:
+        image_list = eval(reader.read())
+    if not image_name in [item['image_name'] for item in image_list]:
+        image_list.append({'image_name' : image_name})
+    with open(f'info/{collection_name}.json', 'w') as writer:
+        writer.write(json.dumps(image_list, indent=4))
+    return 'Done'.encode()
+
+
+@app.route('/upload_json', methods=['POST'])
+def upload_json():
+    params = request.get_json(silent=True)
+    collection_name = params['collection_name']
+    with open(
+        'json/' + collection_name + '/' + params['json_name'], 'w'
+    ) as writer:
+        writer.write(params['content'])
+    return 'Done'.encode()
+
+
+@app.route('/rename_image', methods=['POST'])
+def rename_image():
+    params = request.get_json(silent=True)
+    collection_name = params['collection_name']
+    origin_name = params['origin_name']
+    new_name = params['new_name']
+    suffix = '.' + origin_name.split('.')[-1]
+    new_name = new_name.split('.')[0] + suffix
+    # Update image_list.json
+    with open(f'info/{collection_name}.json', 'r') as reader:
+        image_list = eval(reader.read())
+    try:
+        image_list.remove({'image_name': origin_name})
+        print('Remove image {} successfully!'.format(origin_name))
+        assert not new_name in [item['image_name'] for item in image_list]
+        image_list.append({'image_name' : new_name})
+    except Exception as e:
+        print(e)
+    with open(f'info/{collection_name}.json', 'w') as writer:
+        writer.write(json.dumps(image_list, indent=4))
+    # Update image files
+    for ratio in ['', '_0.25', '_0.5', '_1.0', '_2.0', '_4.0']:
+        os.system(
+            f'mv images/{collection_name}/{origin_name.replace(suffix, ratio + suffix)} '
+            f'images/{collection_name}/{new_name.replace(suffix, ratio + suffix)}'
+        )
+    # Updage json file
+    os.system(
+        'mv json/{}/{} json/{}/{}'.format(
+            collection_name,
+            origin_name.replace(suffix, '') + '.json',
+            collection_name,
+            new_name.replace(suffix, '') + '.json'
+        )
+    )
+    return new_name.encode()
+
+
+@app.route('/remove_image', methods=['POST'])
+def remove_image():
+    params = request.get_json(silent=True)
+    collection_name = params['collection_name']
+    image_name = params['image_name']
+    suffix = '.' + image_name.split('.')[-1]
+    # Update image_list.json
+    with open(f'info/{collection_name}.json', 'r') as reader:
+        image_list = eval(reader.read())
+    try:
+        image_list.remove({'image_name': image_name})
+        print('Remove image {} successfully!'.format(image_name))
+    except Exception as e:
+        print(e)
+    with open(f'info/{collection_name}.json', 'w') as writer:
+        writer.write(json.dumps(image_list, indent=4))
+    # remove image files
+    for ratio in ['', '_0.25', '_0.5', '_1.0', '_2.0', '_4.0']:
+        os.system(
+            'rm images/{}/{}'.format(
+                collection_name,
+                image_name.replace(suffix, ratio + suffix)
+            )
+        )
+    # remove json file
+    os.system('rm json/{}/{}'.format(collection_name, image_name.replace(suffix, '') + '.json'))
+    return image_name.encode()
+
+
+@app.route('/prev_json', methods=['POST'])
+def prev_json():
+    params = request.get_json(silent=True)
+    collection_name = params['collection_name']
+    image_name = params['image_name']
+    print(f'prev_json: {collection_name}/{image_name}')
+    with open(f'info/{collection_name}.json', 'r') as reader:
+        image_list = [item['image_name'] for item in eval(reader.read())]
+    image_list.sort()
+    cur_idx = image_list.index(image_name)
+    if cur_idx > 0:
+        dst_idx = -1
+        for idx in range(cur_idx - 1, -1, -1):
+            json_path = (
+                'json/' + collection_name + '/'
+                + image_list[idx].split('.')[0] + '.json'
+            )
+            if os.path.exists(json_path):
+                with open(json_path, 'r') as reader:
+                    content = eval(reader.read())
+                if len(content) > 0:
+                    dst_idx = idx
+                    break
+        if dst_idx != -1:
+            os.system(
+                'cp ' + json_path + ' json/' + collection_name + '/'
+                + image_name.split('.')[0] + '.json'
+            )
+    return 'Done'.encode()
+
+
+@app.route('/next_json', methods=['POST'])
+def next_json():
+    params = request.get_json(silent=True)
+    collection_name = params['collection_name']
+    image_name = params['image_name']
+    print(f'next_json: {collection_name}/{image_name}')
+    with open(f'info/{collection_name}.json', 'r') as reader:
+        image_list = [item['image_name'] for item in eval(reader.read())]
+    image_list.sort()
+    cur_idx = image_list.index(image_name)
+    if cur_idx < (len(image_list) - 1):
+        dst_idx = -1
+        for idx in range(cur_idx + 1, len(image_list)):
+            json_path = (
+                'json/' + collection_name + '/'
+                + image_list[idx].split('.')[0] + '.json'
+            )
+            if os.path.exists(json_path):
+                with open(json_path, 'r') as reader:
+                    content = eval(reader.read())
+                if len(content) > 0:
+                    dst_idx = idx
+                    break
+        if dst_idx != -1:
+            os.system(
+                'cp ' + json_path + ' json/' + collection_name + '/'
+                + image_name.split('.')[0] + '.json'
+            )
+    return 'Done'.encode()
+
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port='8001')

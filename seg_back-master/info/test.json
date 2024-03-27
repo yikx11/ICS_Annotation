@@ -1,0 +1,62 @@
+[
+    {
+        "image_name": "Path.jpg",
+        "height": 231,
+        "width": 240
+    },
+    {
+        "image_name": "Neck.jpg",
+        "height": 472,
+        "width": 474
+    },
+    {
+        "image_name": "Teeth.jpg",
+        "height": 324,
+        "width": 600
+    },
+    {
+        "image_name": "Brain.jpg",
+        "height": 512,
+        "width": 512
+    },
+    {
+        "image_name": "Neck_X-ray.jpg",
+        "height": 716,
+        "width": 546
+    },
+    {
+        "image_name": "Liver.jpg",
+        "height": 672,
+        "width": 800
+    },
+    {
+        "image_name": "Right_Ventricle.jpg",
+        "height": 212,
+        "width": 252
+    },
+    {
+        "image_name": "Muscle.jpg",
+        "height": 375,
+        "width": 358
+    },
+    {
+        "image_name": "Sinus.jpg",
+        "height": 882,
+        "width": 1264
+    },
+    {
+        "image_name": "Muscle_2.jpg",
+        "height": 519,
+        "width": 523
+    },
+    {
+        "image_name": "Muscle_3.jpg",
+        "height": 494,
+        "width": 656
+    },
+    {
+        "image_name": "Path_2.jpg",
+        "height": 731,
+        "width": 791
+    }
+]

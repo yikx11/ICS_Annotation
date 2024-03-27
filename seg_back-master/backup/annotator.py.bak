@@ -1,0 +1,282 @@
+import os
+import cv2
+import numpy as np
+import PIL.Image as Image
+import torch
+import matplotlib.pyplot as plt
+import torchvision.transforms as transforms
+import skimage.measure as measure
+
+from dla import get_arch as dla_get_arch
+
+
+def get_cityscapes_label_name(label_id):
+    id2info = {
+        0 : ('road', (128, 64, 128)),
+        1 : ('sidewalk', (244, 35, 232)),
+        2 : ('building', (70, 70, 70)),
+        3 : ('wall', (102, 102, 156)),
+        4 : ('fence', (190, 153, 153)),
+        5 : ('pole', (153, 153, 153)),
+        6 : ('traffic light', (250, 170, 30)),
+        7 : ('traffic sign', (220, 220, 0)),
+        8 : ('vegetation', (107, 142, 35)),
+        9 : ('terrain', (152, 251, 152)),
+        10 : ('sky', (70, 130, 180)),
+        11 : ('person', (220, 20, 60)),
+        12 : ('rider', (255, 0, 0)),
+        13 : ('car', (0, 0, 142)),
+        14 : ('truck', (0, 0, 70)),
+        15 : ('bus', (0, 60, 100)),
+        16 : ('train', (0, 80, 100)),
+        17 : ('motorcycle', (0, 0, 230)),
+        18 : ('bicycle', (119, 11, 32)),
+    }
+    return id2info[label_id][0]
+
+
+def compress(p_list, compress_degree=20):
+    written_list = []
+    c = 1e-3
+    for i in range(0, p_list.shape[0]):
+        ele = p_list[i, :]
+        if i > 0 and i < p_list.shape[0] - 1:
+            first_dir = ele - p_list[i - 1, :]  # 向量1数值
+            second_dir = p_list[i + 1, :] - ele  # 向量2数值
+            vector = first_dir * second_dir
+            v = np.sqrt((vector * vector).sum())
+            ab = v / (
+                    np.sqrt((first_dir * first_dir).sum())
+                    * np.sqrt((second_dir * second_dir).sum())
+                )
+            if ab >= 1 - c and ab <= 1 + c:
+                continue
+            elif ab >= -1 - c and ab <= -1 + c:
+                continue
+            elif ab >= 0 - c and ab <= 0 + c:
+                continue
+            last_p = written_list[len(written_list) - 1]
+            dis = ele - last_p
+            if np.sqrt((dis * dis).sum()) < compress_degree * np.sqrt(2):
+                continue
+        written_list.append(ele)
+    ret = np.array(written_list)
+    return ret
+
+
+def approx_contour(base_contour, new_contour, alpha):
+    # base_contour.shape = (N1, 1, 2)
+    # new_contour.shape = (N2, 1, 2)
+    new_contour = new_contour.reshape(1, -1, 2)
+    # new_contour.shape = (1, N2, 2)
+    dist = np.sqrt(np.sum(np.square(base_contour - new_contour), axis=2))
+    # dist.shape = (N1, N2)
+    match_indexes = np.argmin(dist, axis=1)
+    match_contour = new_contour[0][match_indexes].reshape(-1, 1, 2)
+    res_contour = (1 - alpha) * base_contour + alpha * match_contour
+    # res_contour = np.round(res_contour).astype(np.int)
+    print(base_contour.shape, res_contour.shape)
+    return res_contour
+
+
+def get_contour(mask, compress_degree):
+    # Get contour
+    h = cv2.findContours(
+        mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    contours = h[0]
+    contours.sort(key=lambda x : cv2.contourArea(x), reverse=True)
+    # contours = [cv2.convexHull(contour) for contour in contours]
+    # contour = cv2.convexHull(contours[0]).astype(np.float)
+    contour = contours[0].astype(np.float)
+    contour = compress(contour, compress_degree)
+    return contour
+
+
+class Annotator():
+
+    def __init__(self):
+        if torch.cuda.is_available():
+            self.device = torch.device('cuda')
+        else:
+            self.device = torch.device('cpu')
+        arch = 'dla_dla34'
+        # checkpoint = torch.load(
+        #     'checkpoints/dla_dla34_epoch_47.pth',
+        #     map_location=self.device,
+        # )
+        self.image_name = ''
+        self.prediction = None
+        self.model = torch.nn.DataParallel(dla_get_arch(arch).to(self.device))
+        # self.model.load_state_dict(checkpoint['state_dict'])
+        # checkpoint = torch.load(
+        #     'checkpoints/dla_dla34_ct.pth',
+        #     map_location=self.device,
+        # )
+        self.ct_model = torch.nn.DataParallel(
+            dla_get_arch(arch, 1).to(self.device)
+        )
+        # self.ct_model.load_state_dict(checkpoint['state_dict'])
+
+        self.optimizer = torch.optim.Adam(
+            params=self.model.parameters(), lr=1e-4,
+        )
+        self.criterion = torch.nn.NLLLoss()
+        self.model_finetuned = False
+
+        self.hist_bin_size = 100
+        self.hist_ratio = 0.9
+
+    def predict(self, image_name, bbox, compress_degree):
+        # image : a numpy array with shape (height, width, 3)
+        # bbox : a dictionary with keys ['xmin', 'ymin', 'width', 'height']
+        print('Given image_name:', image_name)
+        print('Given bbox:', bbox)
+        xmin = int(bbox['xmin'] + 0.5)
+        ymin = int(bbox['ymin'] + 0.5)
+        xmax = int(bbox['xmin'] + bbox['width'])
+        ymax = int(bbox['ymin'] + bbox['height'])
+        bbox = {
+            'xmin': xmin, 'ymin': ymin, 'width': xmax - xmin,
+            'height': ymax - ymin
+        }
+        if self.image_name != image_name:
+            if not os.path.exists(
+                'annos/' + image_name.split('.')[0] + '.npy'
+            ) or self.model_finetuned:
+                self.model_finetuned = False
+                print('Start predicting from scratch')
+                image = np.array(Image.open('images/' + image_name))
+                # Padding 'h' and 'w' to 32x
+                padding_h = (32 - (image.shape[0] % 32)) % 32
+                padding_w = (32 - (image.shape[1] % 32)) % 32
+                image = np.pad(
+                    image, ((0, padding_h), (0, padding_w), (0, 0)),
+                    'symmetric'
+                )
+                image = transforms.ToTensor()(image).to(self.device)
+                image = image.view(1, *image.size())
+                if image_name.startswith('i'):
+                    with torch.no_grad():
+                        pred = self.ct_model(image)
+                    pred = pred[0].sigmoid()
+                else:
+                    with torch.no_grad():
+                        pred = self.model(image)
+                    pred = pred[0].softmax(dim=0)   # There is only one image
+                pred = pred.cpu().data.numpy()
+                self.prediction = pred
+                if not os.path.exists('annos'):
+                    os.mkdir('annos')
+                np.save('annos/' + image_name.split('.')[0] + '.npy', pred)
+            else:
+                print('Load local npy file')
+                pred = np.load('annos/' + image_name.split('.')[0] + '.npy')
+                self.prediction = pred
+        else:
+            print('Use the previous result')
+            pred = self.prediction
+        self.image_name = image_name
+        # Get the largest region
+        if image_name.startswith('i'):
+            pred = (pred > 0.5).astype(np.int).reshape(*pred.shape[1 :])
+        else:
+            pred = np.argmax(pred, axis=0)
+            pred[pred < 6] = 0
+            pred[(pred > 7) & (pred < 11)] = 0
+        pred = pred[ymin : ymax, xmin : xmax]
+        label_id = np.argmax(np.bincount(pred.reshape(-1))[1 :]) + 1
+        labels = measure.label(pred == label_id, connectivity=2, background=0)
+        regions = measure.regionprops(labels)
+        max_idx = np.argmax(np.bincount(labels.reshape(-1))[1 :]) + 1
+        mask = (labels == max_idx).astype(np.uint8)
+        print(label_id, get_cityscapes_label_name(label_id))
+        contour = get_contour(mask, compress_degree)
+        res = [
+            {'x': xmin + point[0, 0], 'y': ymin + point[0, 1]}
+            for point in contour
+        ]
+        return res
+
+    def update(self, image_name, anno, alpha, compress_degree):
+        print('update', image_name)
+        bbox = anno['bbox']
+        path = anno['path']
+        xmin = int(bbox['xmin'] + 0.5)
+        ymin = int(bbox['ymin'] + 0.5)
+        xmax = int(bbox['xmin'] + bbox['width'])
+        ymax = int(bbox['ymin'] + bbox['height'])
+        bbox = {
+            'xmin': xmin, 'ymin': ymin, 'width': xmax - xmin,
+            'height': ymax - ymin
+        }
+        contour = np.array(
+            [
+                [[point['x'] - xmin, point['y'] - ymin]]
+                for point in path
+            ]
+        ).astype(np.int)
+        # contour = cv2.convexHull(contour)
+        contour = contour.reshape(1, *contour.shape)
+        anno_mask = np.zeros((ymax - ymin, xmax - xmin), dtype=np.uint8)
+        anno_mask = cv2.fillPoly(anno_mask, contour, (255))
+        # Save new mask
+        save_mask = np.argmax(self.prediction, axis=0).astype(np.uint8)
+        label_id = np.argmax(
+            np.bincount(save_mask[ymin : ymax, xmin : xmax][anno_mask == 255])
+        )
+        print('label_id', label_id)
+        save_mask[ymin : ymax, xmin : xmax][anno_mask == 255] = label_id
+        Image.fromarray(save_mask).save(
+            'annos/' + self.image_name.split('.')[0] + '.png'
+        )
+        # anno_mask = cv2.drawContours(anno_mask, contour, -1, (1))
+        pred = self.prediction[label_id, ymin : ymax, xmin : xmax]
+        hist, _ = np.histogram(
+            pred[anno_mask == 255] * self.hist_bin_size,
+            np.arange(self.hist_bin_size)
+        )
+        hist = np.array(hist) / np.sum(hist)
+        hist = 1 - np.cumsum(hist)
+        hist[hist < self.hist_ratio] = 1
+        thres = np.min([0.5, np.argmin(hist) / self.hist_bin_size])
+        # thres = np.min(pred[anno_mask])
+        mask = (pred > thres).astype(np.uint8)
+        # Make the changes as tiny as possible
+        new_contour = get_contour(mask, compress_degree)
+        contour = approx_contour(
+            contour.reshape(-1, 1, 2), new_contour, alpha
+        )
+        res = [
+            {'x': xmin + point[0, 0], 'y': ymin + point[0, 1]}
+            for point in contour
+        ]
+        return res
+
+    def finetune(self, image_name):
+        transform = transforms.ToTensor()
+        image = np.array(Image.open('images/' + image_name))
+        image = transform(image)
+        image = image.view(1, *image.size())
+        mask = np.array(
+            Image.open('annos/' + image_name.split('.')[0] + '.png')
+        )
+        mask = torch.tensor(mask).view(1, *mask.shape).long()
+        output = self.model(image)
+        loss = self.criterion(output, mask)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        print('loss =', loss.item())
+        self.model_finetuned = True
+
+
+def test():
+    base_contour = np.array([[0, 0], [0, 1], [1, 1], [1, 0]]).reshape(-1, 1, 2)
+    new_contour = np.array([[-1, 0], [0, 2], [2, 0]]).reshape(-1, 1, 2)
+    res = approx_contour(base_contour, new_contour, 0.5)
+    print(res.shape)
+    print(res)
+
+if __name__ == '__main__':
+    test()

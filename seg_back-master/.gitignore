@@ -1,0 +1,6 @@
+json/
+images/
+sitk_images/
+ckpts/
+*__pycache__*
+*.pyc
